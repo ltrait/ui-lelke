@@ -1,0 +1,11 @@
+.envrc
+
+# For Nix
+result
+result-*
+
+
+# Added by cargo
+
+/target
+Cargo.lock

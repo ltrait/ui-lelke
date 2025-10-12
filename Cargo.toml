@@ -1,0 +1,22 @@
+[package]
+name = "ltrait-ui-lelke" # see also https://ja.wiktionary.org/wiki/lelkiismeret
+version = "0.1.0"
+edition = "2024"
+
+authors = ["satler <satler@satler.dev>"]
+license = "MIT"
+repository = "https://github.com/ltrait/ui-gpui"
+exclude = [".envrc"]
+
+[dependencies]
+ltrait = "1.2.0"
+gpui = { version = "*" }
+log = "0.4.28"
+
+
+tokio = { version = "1.47.1", features = ["full"], optional = true }
+
+[features]
+default = ["dev"]
+# default = [] # TODO:
+dev = ["dep:tokio"]
