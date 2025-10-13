@@ -20,16 +20,46 @@
       };
 
       rust-bin = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+      libs =
+        with pkgs;
+        (pkgs.lib.strings.optionalString stdenv.isLinux [
+          glib
+          # openssl_3
+          openssl
+          vulkan-headers
+          vulkan-loader
+          wayland
+          wayland-protocols
+        ])
+        ++ [ ];
     in
     {
       devShells.${system}.default = pkgs.mkShell {
         name = "ltrait";
 
-        buildInputs = with pkgs; [
-          rust-bin
+        shellHook = ''
+          export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libs}:$LD_LIBRARY_PATH
+        '';
 
-          cargo-nextest
-        ];
+        buildInputs =
+          with pkgs;
+          [
+            rust-bin
+
+            cargo-nextest
+            (pkgs.rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; })
+          ]
+          ++ (pkgs.lib.strings.optionalString stdenv.isLinux [
+            fontconfig
+            glib
+            libxkbcommon
+            openssl_3
+            pkg-config
+            vulkan-tools
+            wayland-scanner
+            xorg.libxcb
+          ]);
       };
     };
 }
