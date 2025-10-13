@@ -17,9 +17,13 @@ enum Context {
 #[tokio::main]
 async fn main() -> Result<()> {
     use ltrait::{Launcher, Level, action::ClosureAction, source::from_iter};
-    use ltrait_ui_lelke::{Lelke, LelkeEntry};
+    use ltrait_ui_lelke::{Lelke, LelkeEntry, LelkeEntryStyle, LelkeTheme};
 
-    let _guard = ltrait::setup(Level::INFO)?;
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(Level::DEBUG)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+        .init();
 
     let launcher = Launcher::default()
         .add_raw_source(from_iter(vec![
@@ -27,7 +31,18 @@ async fn main() -> Result<()> {
             Context::Simple(1),
             Context::Simple(2),
         ]))
-        .set_ui(Lelke::new(), |_| LelkeEntry {})
+        .set_ui(
+            Lelke::new(ltrait_ui_lelke::LelkeConfig {
+                height: 500.,
+                width: 500.,
+                app_id: Some("lelke".into()),
+                theme: LelkeTheme::default_dark(),
+            }),
+            |Context::Simple(u)| LelkeEntry {
+                ty: ltrait_ui_lelke::LelkeEntryType::Simple(*u),
+                style: LelkeEntryStyle::default(),
+            },
+        )
         .add_raw_action(ClosureAction::new(|c| {
             println!("{c:?}");
             Ok(())

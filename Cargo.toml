@@ -9,14 +9,16 @@ repository = "https://github.com/ltrait/ui-gpui"
 exclude = [".envrc"]
 
 [dependencies]
-ltrait = "1.2.0"
+ltrait = "=1.5.0"
 gpui = { version = "*" }
-log = "0.4.28"
+tracing = "0.1.41"
+futures = "0.3.31"
 
 
 tokio = { version = "1.47.1", features = ["full"], optional = true }
+tracing-subscriber = { version = "0.3.20", optional = true }
 
 [features]
 default = ["dev"]
 # default = [] # TODO:
-dev = ["dep:tokio"]
+dev = ["dep:tokio", "dep:tracing-subscriber"]
