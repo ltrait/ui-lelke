@@ -2,9 +2,11 @@ use ltrait::color_eyre::Result;
 
 #[cfg(not(feature = "dev"))]
 fn main() -> Result<()> {
+    use ltrait::color_eyre::eyre::eyre;
+
     eyre!(
         "This crate cannot be executed without the `dev` feature flag. Please enable it or use as a lib crate"
-    );
+    )?
 }
 
 #[cfg(feature = "dev")]

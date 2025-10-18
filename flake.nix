@@ -21,9 +21,11 @@
 
       rust-bin = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
+      lib = pkgs.lib;
+
       libs =
         with pkgs;
-        (pkgs.lib.strings.optionalString stdenv.isLinux [
+        (lib.optionals stdenv.isLinux [
           glib
           # openssl_3
           openssl
@@ -31,8 +33,7 @@
           vulkan-loader
           wayland
           wayland-protocols
-        ])
-        ++ [ ];
+        ]);
     in
     {
       devShells.${system}.default = pkgs.mkShell {
@@ -48,9 +49,8 @@
             rust-bin
 
             cargo-nextest
-            (pkgs.rust-bin.stable.latest.default.override { extensions = [ "rust-src" ]; })
           ]
-          ++ (pkgs.lib.strings.optionalString stdenv.isLinux [
+          ++ (lib.optionals stdenv.isLinux [
             fontconfig
             glib
             libxkbcommon
