@@ -133,14 +133,14 @@ where
 
         if let Some(id) = rx.try_recv()? {
             tx.send(batcher.compute_cushion(id)?)
-                .map_err(|_| eyre!("oneshot channel is full of cushion.??"))?;
+                .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
             return Ok(());
         }
     }
 
     let id = rx.await?;
     tx.send(batcher.compute_cushion(id)?)
-        .map_err(|_| eyre!("oneshot channel is full of cushion.??"))?;
+        .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
 
     Ok(())
 }
@@ -208,7 +208,7 @@ where
             cx.activate(true);
         });
 
-        Ok(None)
+        Ok(None) // TODO:
     }
 }
 
@@ -229,10 +229,10 @@ impl Render for RootView {
             .child(HelloWorld {
                 text: "World".into(),
             })
-            .bg(theme.bg.clone())
+            .bg(theme.bg)
             .border_1()
-            .border_color(theme.border.clone())
-            .text_color(theme.entry_fg.clone()) // TODO: 違うかも
+            .border_color(theme.border)
+            .text_color(theme.entry_fg) // TODO: 違うかも
             .child(Items.compute_element(&self.buf, cx))
     }
 }
@@ -301,7 +301,6 @@ impl IntoElement for HelloWorld {
                             .bg(gpui::black())
                             .border_1()
                             .border_dashed()
-                            .rounded_md()
                             .rounded_md()
                             .border_color(gpui::white()),
                     )
