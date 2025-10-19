@@ -1,32 +1,44 @@
 use gpui::{
-    App, Application, AsyncApp, Bounds, Context, Entity, Font, Global, Rgba, SharedString,
+    Action, App, Application, AsyncApp, Bounds, Context, Entity, Global, KeyBinding, Rgba,
     Subscription, Window, WindowBounds, WindowOptions, colors::Colors, div, prelude::*, px, size,
 };
 
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use futures::channel::oneshot;
 
 use ltrait::{
     UI,
-    color_eyre::eyre::{Result, eyre},
+    color_eyre::eyre::{Result, bail, eyre},
     launcher::batcher::Batcher,
     ui::{Buffer, Position},
 };
+
+pub use gpui::{
+    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString,
+    WindowBackgroundAppearance, rgba,
+};
+
+use derive_more::Debug;
 
 #[derive(Debug, Clone)]
 pub struct LelkeConfig {
     pub height: f32,
     pub width: f32,
     pub app_id: Option<String>,
+    #[debug("binding")]
+    pub bindings: Arc<dyn Fn(&mut KeyBinder) + Sync + Send + 'static>,
     pub theme: LelkeTheme,
 }
 
 #[derive(Debug, Clone)]
 pub struct LelkeTheme {
-    pub background_appearance: gpui::WindowBackgroundAppearance,
+    pub background_appearance: WindowBackgroundAppearance,
 
     pub bg: Rgba,
     pub entry_bg: Rgba,
@@ -106,12 +118,86 @@ pub struct LelkeEntryStyle {
     pub font: Option<Font>,
 }
 
+#[derive(Debug, Default)]
+pub struct KeyBinder {
+    binds: Vec<KeyBinding>,
+}
+
+impl KeyBinder {
+    pub fn bind<A: Action>(&mut self, keystrokes: &str, action: A) {
+        self.binds.push(KeyBinding::new(keystrokes, action, None))
+    }
+
+    fn bind_keys(&self, cx: &mut App) {
+        info!("Binding keys");
+
+        cx.bind_keys(self.binds.clone());
+    }
+
+    fn register_callbacks(&self, cx: &mut App) {
+        info!("Registering action callbacks");
+
+        cx.on_action(actions::quit);
+    }
+}
+
+pub mod actions {
+    use gpui::{BorrowAppContext, actions};
+    use tracing::{error, info};
+
+    use crate::BatcherConnection;
+
+    actions!(lelke, [MoveNext, MovePrevious, Quit, Select,]);
+
+    pub(crate) fn quit(_: &Quit, cx: &mut gpui::App) {
+        info!("Quitting...");
+
+        cx.update_global::<BatcherConnection, _>(|bc, _| {
+            bc.0.take().map(|tx| {
+                if let Err(_) = tx.send(None) {
+                    error!("failed to send none");
+                }
+            })
+        });
+
+        info!("Shutting down");
+        cx.shutdown();
+    }
+
+    pub(crate) fn select(_: &Select, cx: &mut gpui::App) {
+        info!("Quitting... with Selected");
+
+        cx.update_global::<BatcherConnection, _>(|bc, _| {
+            bc.0.take().map(|tx| {
+                if let Err(_) = tx.send(Some(todo!())) {
+                    // TODO:
+                    error!("failed to send id");
+                }
+            })
+        });
+
+        info!("Shutting down");
+        cx.shutdown();
+    }
+}
+
+pub fn example_bindings(kbd: &mut KeyBinder) {
+    use actions::*;
+
+    kbd.bind("tab", MoveNext);
+    kbd.bind("shift-tab", MovePrevious);
+    kbd.bind("up", MoveNext); // TODO: いまのところは下入力想定
+    kbd.bind("down", MovePrevious);
+    kbd.bind("escape", Quit);
+    kbd.bind("enter", Select);
+}
+
 async fn batcher_thread<Cushion>(
     mut cx: AsyncApp,
     mut batcher: Batcher<Cushion, LelkeEntry>,
     buf: Entity<Buffer<(LelkeEntry, usize)>>,
-    mut rx: oneshot::Receiver<usize>,
-    tx: oneshot::Sender<Cushion>,
+    mut rx: oneshot::Receiver<Option<usize>>,
+    tx: oneshot::Sender<Option<Cushion>>,
 ) -> Result<()>
 where
     Cushion: Send + Sync + 'static,
@@ -132,22 +218,24 @@ where
             .map_err(|err| eyre!("{err}"))??;
 
         if let Some(id) = rx.try_recv()? {
-            tx.send(batcher.compute_cushion(id)?)
+            info!("received id, now computing cushion");
+            tx.send(id.map(|id| batcher.compute_cushion(id)).transpose()?)
                 .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
             return Ok(());
         }
     }
 
     let id = rx.await?;
-    tx.send(batcher.compute_cushion(id)?)
+    info!("received id, now computing cushion");
+    tx.send(id.map(|id| batcher.compute_cushion(id)).transpose()?)
         .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
 
     Ok(())
 }
 
-struct BatcherConnection<T>(oneshot::Sender<usize>, oneshot::Receiver<T>);
+struct BatcherConnection(Option<oneshot::Sender<Option<usize>>>);
 
-impl<T: 'static> Global for BatcherConnection<T> {}
+impl Global for BatcherConnection {}
 
 impl<Cushion> UI<Cushion> for Lelke
 where
@@ -158,6 +246,9 @@ where
     #[tracing::instrument(skip_all)]
     async fn run(&self, batcher: Batcher<Cushion, Self::Context>) -> Result<Option<Cushion>> {
         let config = self.config.clone();
+
+        let (tx, cushion) = oneshot::channel();
+
         Application::new().run(move |cx: &mut App| {
             cx.set_global(config);
 
@@ -165,6 +256,10 @@ where
             let bounds = Bounds::centered(None, size(px(config.width), px(config.height)), cx);
 
             let theme = config.theme.clone();
+
+            let mut binder = KeyBinder::default();
+            (config.bindings)(&mut binder);
+            let binder = binder;
 
             cx.open_window(
                 WindowOptions {
@@ -181,10 +276,12 @@ where
                     let buf: Entity<Buffer<(LelkeEntry, usize)>> = cx.new(|_| Buffer::default());
                     _subscriptions.push(cx.observe(&buf, |_, _| ()));
 
-                    let (tx, rec) = oneshot::channel();
                     let (sen, rx) = oneshot::channel();
 
-                    cx.set_global(BatcherConnection(sen, rec));
+                    cx.set_global(BatcherConnection(Some(sen)));
+
+                    binder.bind_keys(cx);
+                    binder.register_callbacks(cx);
 
                     {
                         let buf = buf.clone();
@@ -208,7 +305,12 @@ where
             cx.activate(true);
         });
 
-        Ok(None) // TODO:
+        info!("receiving Cushion");
+        if let Ok(cu) = cushion.await {
+            Ok(cu)
+        } else {
+            bail!("failed to receive cushion")
+        }
     }
 }
 
