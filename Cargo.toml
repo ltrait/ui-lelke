@@ -13,14 +13,15 @@ ltrait = "=1.5.0"
 gpui = { version = "*" }
 tracing = "0.1.41"
 futures = "0.3.31"
+derive_more = { version = "2.0.1", features = ["full"] } # TODO: minimize
 
 
+# TODO: remove
 tokio = { version = "1.47.1", features = [
   "rt-multi-thread",
   "macros",
 ], optional = true }
 tracing-subscriber = { version = "0.3.20", optional = true }
-derive_more = { version = "2.0.1", features = ["full"] }
 
 [features]
 default = ["dev"]
