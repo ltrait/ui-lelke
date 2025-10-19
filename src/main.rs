@@ -18,12 +18,15 @@ enum Context {
 #[cfg(feature = "dev")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::sync::Arc;
+
     use ltrait::{Launcher, Level, action::ClosureAction, source::from_iter};
     use ltrait_ui_lelke::{Lelke, LelkeEntry, LelkeEntryStyle, LelkeTheme};
 
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_max_level(Level::DEBUG)
+        // .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
         .init();
 
@@ -39,6 +42,7 @@ async fn main() -> Result<()> {
                 width: 500.,
                 app_id: Some("lelke".into()),
                 theme: LelkeTheme::default_dark(),
+                bindings: Arc::new(ltrait_ui_lelke::example_bindings),
             }),
             |Context::Simple(u)| LelkeEntry {
                 ty: ltrait_ui_lelke::LelkeEntryType::Simple(*u),
