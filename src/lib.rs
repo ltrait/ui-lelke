@@ -176,7 +176,7 @@ pub mod actions {
             })
         });
 
-        info!("Shutting down");
+        info!("Shutting down"); // もしあれならshutdownをobserve_globalでやるようにすればいい
         cx.shutdown();
     }
 }
