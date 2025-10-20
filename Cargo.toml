@@ -12,8 +12,9 @@ exclude = [".envrc"]
 ltrait = "=1.5.0"
 gpui = { version = "*" }
 tracing = "0.1.41"
-futures = "0.3.31"
 derive_more = { version = "2.0.1", features = ["full"] } # TODO: minimize
+futures = "0.3.31"
+futures-timer = "3.0.3"
 
 
 # TODO: remove
@@ -22,6 +23,7 @@ tokio = { version = "1.47.1", features = [
   "macros",
 ], optional = true }
 tracing-subscriber = { version = "0.3.20", optional = true }
+gpui-component = "0.2.0"
 
 [features]
 default = ["dev"]

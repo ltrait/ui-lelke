@@ -3,25 +3,30 @@ use gpui::{
     Subscription, Window, WindowBounds, WindowOptions, colors::Colors, div, prelude::*, px, size,
 };
 
-use tracing::{debug, error, info};
-
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
+pub use gpui::{
+    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString,
+    WindowBackgroundAppearance, rgba,
+};
+use gpui_component::{
+    Root,
+    input::{InputEvent, InputState, TextInput},
 };
 
-use futures::channel::oneshot;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use futures::{
+    StreamExt,
+    channel::{mpsc, oneshot},
+    future::{Either, select},
+};
+use futures_timer::Delay;
+use tracing::{debug, error, info};
 
 use ltrait::{
     UI,
     color_eyre::eyre::{Result, bail, eyre},
     launcher::batcher::Batcher,
     ui::{Buffer, Position},
-};
-
-pub use gpui::{
-    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString,
-    WindowBackgroundAppearance, rgba,
 };
 
 use derive_more::Debug;
@@ -34,6 +39,7 @@ pub struct LelkeConfig {
     #[debug("binding")]
     pub bindings: Arc<dyn Fn(&mut KeyBinder) + Sync + Send + 'static>,
     pub theme: LelkeTheme,
+    pub placeholder: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -134,50 +140,89 @@ impl KeyBinder {
         cx.bind_keys(self.binds.clone());
     }
 
-    fn register_callbacks(&self, cx: &mut App) {
+    fn register_callbacks(&self, cx: &mut App, buf: Entity<Buf>, selecting: Entity<Selecting>) {
         info!("Registering action callbacks");
 
         cx.on_action(actions::quit);
+        cx.on_action(actions::select(buf.clone(), selecting.clone()));
+        cx.on_action(actions::move_next(buf.clone(), selecting.clone()));
+        cx.on_action(actions::move_previous(selecting));
     }
 }
 
+type Buf = Buffer<(LelkeEntry, usize)>;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Selecting(usize);
+
 pub mod actions {
-    use gpui::{BorrowAppContext, actions};
+    use gpui::{App, BorrowAppContext, Entity, actions};
+    use ltrait::ui::Position;
     use tracing::{error, info};
 
-    use crate::BatcherConnection;
+    use crate::{BatcherConnection, Buf, Selecting};
 
     actions!(lelke, [MoveNext, MovePrevious, Quit, Select,]);
 
-    pub(crate) fn quit(_: &Quit, cx: &mut gpui::App) {
+    pub(crate) fn quit(_: &Quit, cx: &mut App) {
         info!("Quitting...");
 
         cx.update_global::<BatcherConnection, _>(|bc, _| {
-            bc.0.take().map(|tx| {
-                if let Err(_) = tx.send(None) {
-                    error!("failed to send none");
-                }
-            })
+            if let Some(Err(_)) = bc.0.take().map(|tx| tx.send(None)) {
+                error!("failed to send none");
+            }
         });
 
         info!("Shutting down");
         cx.shutdown();
     }
 
-    pub(crate) fn select(_: &Select, cx: &mut gpui::App) {
-        info!("Quitting... with Selected");
+    pub(crate) fn select(
+        buf: Entity<Buf>,
+        selecting: Entity<Selecting>,
+    ) -> impl Fn(&Select, &mut App) {
+        move |_: &Select, cx: &mut App| {
+            info!("Quitting... with Selected");
 
-        cx.update_global::<BatcherConnection, _>(|bc, _| {
-            bc.0.take().map(|tx| {
-                if let Err(_) = tx.send(Some(todo!())) {
-                    // TODO:
-                    error!("failed to send id");
+            let pos = selecting.read(cx).0;
+            let mut pos = Position(pos);
+            let id = buf.read(cx).next(&mut pos).map(|(_, id)| *id);
+
+            cx.update_global::<BatcherConnection, _>(|bc, _| {
+                if let Some(Err(_)) = bc.0.take().map(|tx| tx.send(id)) {
+                    error!("failed to send none");
                 }
-            })
-        });
+            });
 
-        info!("Shutting down"); // もしあれならshutdownをobserve_globalでやるようにすればいい
-        cx.shutdown();
+            info!("Shutting down"); // もしあれならshutdownをobserve_globalでやるようにすればいい
+            cx.shutdown();
+        }
+    }
+
+    pub(crate) fn move_next(
+        buf: Entity<Buf>,
+        selecting: Entity<Selecting>,
+    ) -> impl Fn(&MoveNext, &mut App) {
+        move |_, cx| {
+            let len = buf.read(cx).len();
+
+            selecting.update(cx, |sel, cx| {
+                sel.0 = sel.0.saturating_add(1).min(len.saturating_sub(1));
+
+                cx.notify();
+            })
+        }
+    }
+
+    pub(crate) fn move_previous(selecting: Entity<Selecting>) -> impl Fn(&MovePrevious, &mut App) {
+        move |_, cx| {
+            // todo
+            selecting.update(cx, |sel, cx| {
+                sel.0 = sel.0.saturating_sub(1);
+
+                cx.notify();
+            })
+        }
     }
 }
 
@@ -192,45 +237,113 @@ pub fn example_bindings(kbd: &mut KeyBinder) {
     kbd.bind("enter", Select);
 }
 
+fn send_cushion<T: Send>(
+    tx: oneshot::Sender<Option<T>>,
+    id: Option<usize>,
+    batcher: Batcher<T, LelkeEntry>,
+) -> Result<()> {
+    info!("received id, now computing cushion");
+
+    tx.send(id.map(|id| batcher.compute_cushion(id)).transpose()?)
+        .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
+
+    Ok(())
+}
+
+fn set_input<T: Send>(
+    cx: &mut AsyncApp,
+    buf: &Entity<Buf>,
+    user_input: &Entity<SharedString>,
+    selecting: &Entity<Selecting>,
+
+    batcher: &mut Batcher<T, LelkeEntry>,
+    more: &mut bool,
+) -> Result<()> {
+    let input = user_input
+        .read_with(cx, |input, _| input.to_string())
+        .map_err(|e| eyre!("{e}"))?;
+
+    info!("input: {input}");
+
+    buf.update(cx, |buf, cx| {
+        batcher.input(buf, &input);
+        cx.notify();
+    })
+    .map_err(|e| eyre!("{e}"))?;
+
+    selecting
+        .update(cx, |sel, cx| {
+            sel.0 = 0;
+            cx.notify();
+        })
+        .map_err(|e| eyre!("{e}"))?;
+
+    *more = true;
+
+    Ok(())
+}
+
 async fn batcher_thread<Cushion>(
     mut cx: AsyncApp,
     mut batcher: Batcher<Cushion, LelkeEntry>,
-    buf: Entity<Buffer<(LelkeEntry, usize)>>,
+    buf: Entity<Buf>,
     mut rx: oneshot::Receiver<Option<usize>>,
     tx: oneshot::Sender<Option<Cushion>>,
+    mut inrx: mpsc::Receiver<()>,
+    user_input: Entity<SharedString>,
+    selecting: Entity<Selecting>,
 ) -> Result<()>
 where
     Cushion: Send + Sync + 'static,
 {
     let mut more = true;
-    while more {
-        let from = batcher.prepare().await;
-        more = buf
-            .update(&mut cx, |prev, cx| {
-                let v = batcher.merge(prev, from);
-
-                debug!("merged buffer length: {}", prev.len());
-
-                cx.notify();
-
-                v
-            })
-            .map_err(|err| eyre!("{err}"))??;
+    loop {
+        if let Ok(Some(())) = inrx.try_next() {
+            set_input(
+                &mut cx,
+                &buf,
+                &user_input,
+                &selecting,
+                &mut batcher,
+                &mut more,
+            )?;
+        }
 
         if let Some(id) = rx.try_recv()? {
-            info!("received id, now computing cushion");
-            tx.send(id.map(|id| batcher.compute_cushion(id)).transpose()?)
-                .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
-            return Ok(());
+            return send_cushion(tx, id, batcher);
+        }
+
+        if more {
+            let from = batcher.prepare().await;
+
+            more = buf
+                .update(&mut cx, |prev, cx| {
+                    let v = batcher.merge(prev, from);
+
+                    debug!("merged buffer length: {}", prev.len());
+
+                    cx.notify();
+
+                    v
+                })
+                .map_err(|err| eyre!("{err}"))??;
+        } else {
+            match select(inrx.next(), &mut rx).await {
+                Either::Left((Some(()), _)) => set_input(
+                    &mut cx,
+                    &buf,
+                    &user_input,
+                    &selecting,
+                    &mut batcher,
+                    &mut more,
+                )?,
+                Either::Right((id, _)) => {
+                    return send_cushion(tx, id?, batcher);
+                }
+                _ => (),
+            }
         }
     }
-
-    let id = rx.await?;
-    info!("received id, now computing cushion");
-    tx.send(id.map(|id| batcher.compute_cushion(id)).transpose()?)
-        .map_err(|_| eyre!("failed to send cushion: receiver dropped"))?;
-
-    Ok(())
 }
 
 struct BatcherConnection(Option<oneshot::Sender<Option<usize>>>);
@@ -250,6 +363,8 @@ where
         let (tx, cushion) = oneshot::channel();
 
         Application::new().run(move |cx: &mut App| {
+            gpui_component::init(cx);
+
             cx.set_global(config);
 
             let config = cx.global::<LelkeConfig>();
@@ -269,35 +384,81 @@ where
                     ..Default::default()
                 },
                 |win, cx| {
-                    let mut _subscriptions = vec![];
-
                     theme.apply(win);
 
-                    let buf: Entity<Buffer<(LelkeEntry, usize)>> = cx.new(|_| Buffer::default());
-                    _subscriptions.push(cx.observe(&buf, |_, _| ()));
-
-                    let (sen, rx) = oneshot::channel();
-
-                    cx.set_global(BatcherConnection(Some(sen)));
-
                     binder.bind_keys(cx);
-                    binder.register_callbacks(cx);
 
-                    {
-                        let buf = buf.clone();
+                    let view = cx.new(|cx| {
+                        let mut _subscriptions = vec![];
 
-                        cx.spawn(async move |cx| {
-                            if let Err(e) = batcher_thread(cx.clone(), batcher, buf, rx, tx).await {
-                                error!("Batcher thread of Lelke has been panicked: {e}");
+                        let buf: Entity<Buf> = cx.new(|_| Buffer::default());
+                        _subscriptions.push(cx.observe(&buf, |_, _, _| ()));
+
+                        let (sen, rx) = oneshot::channel();
+
+                        cx.set_global(BatcherConnection(Some(sen)));
+
+                        let (mut intx, inrx) = mpsc::channel(256);
+                        let user_input = cx.new(|_| SharedString::new(""));
+
+                        let selecting = cx.new(|_| Selecting(0));
+                        _subscriptions.push(cx.observe(&selecting, |_, _, _| ()));
+
+                        {
+                            let buf = buf.clone();
+                            let user_input = user_input.clone();
+                            let selecting = selecting.clone();
+
+                            cx.spawn(async move |_, cx| {
+                                if let Err(e) = batcher_thread(
+                                    cx.clone(),
+                                    batcher,
+                                    buf,
+                                    rx,
+                                    tx,
+                                    inrx,
+                                    user_input,
+                                    selecting,
+                                )
+                                .await
+                                {
+                                    error!("Batcher thread of Lelke has been panicked: {e}");
+                                }
+                            })
+                            .detach();
+                        }
+
+                        binder.register_callbacks(cx, buf.clone(), selecting.clone());
+
+                        let items = Items::new(buf, selecting, cx);
+
+                        let placeholder = cx.global::<LelkeConfig>().placeholder;
+                        let input_state =
+                            cx.new(|cx| InputState::new(win, cx).placeholder(placeholder));
+
+                        _subscriptions.push(cx.subscribe_in(&input_state, win, {
+                            let input_state = input_state.clone();
+                            move |_: &mut RootView, _, ev: &InputEvent, _window, cx| {
+                                if let InputEvent::Change = ev {
+                                    let value = input_state.read(cx).value();
+                                    user_input.update(cx, |prev, _| {
+                                        *prev = value;
+
+                                        let _ = intx.try_send(());
+                                    });
+                                    cx.notify()
+                                }
                             }
-                        })
-                        .detach();
-                    }
+                        }));
 
-                    cx.new(|_| RootView {
-                        buf,
-                        _subscriptions,
-                    })
+                        RootView {
+                            input_state,
+                            items,
+                            _subscriptions,
+                        }
+                    });
+
+                    cx.new(|cx| Root::new(view.into(), win, cx))
                 },
             )
             .unwrap();
@@ -306,10 +467,12 @@ where
         });
 
         info!("receiving Cushion");
-        if let Ok(cu) = cushion.await {
-            Ok(cu)
-        } else {
-            bail!("failed to receive cushion")
+
+        let timeout = Delay::new(Duration::from_millis(500));
+        match select(cushion, timeout).await {
+            Either::Left((Ok(cu), _)) => Ok(cu),
+            Either::Right(_) => bail!("failed to receive cushion: timed out"),
+            _ => bail!("failed to receive cushion"),
         }
     }
 }
@@ -317,7 +480,8 @@ where
 // begin gpui
 
 struct RootView {
-    buf: Entity<Buffer<(LelkeEntry, usize)>>,
+    items: Entity<Items>,
+    input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -328,108 +492,30 @@ impl Render for RootView {
         let theme = &config.theme;
 
         div()
-            .child(HelloWorld {
-                text: "World".into(),
-            })
             .bg(theme.bg)
             .border_1()
             .border_color(theme.border)
             .text_color(theme.entry_fg) // TODO: 違うかも
-            .child(Items.compute_element(&self.buf, cx))
+            .child(self.items.clone())
+            .child(TextInput::new(&self.input_state)) // TODO:ここにfocusがあってほしい
     }
 }
-
-struct HelloWorld {
-    text: SharedString,
+struct Items {
+    buf: Entity<Buf>,
+    selecting: Entity<Selecting>,
 }
-
-impl IntoElement for HelloWorld {
-    type Element = gpui::Div;
-
-    fn into_element(self) -> gpui::Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .size(px(500.0))
-            .justify_center()
-            .items_center()
-            .shadow_lg()
-            .text_xl()
-            .child(format!("Hello, {}!", &self.text))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::red())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::white()),
-                    )
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::green())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::white()),
-                    )
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::blue())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::white()),
-                    )
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::yellow())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::white()),
-                    )
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::black())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::white()),
-                    )
-                    .child(
-                        div()
-                            .size_8()
-                            .bg(gpui::white())
-                            .border_1()
-                            .border_dashed()
-                            .rounded_md()
-                            .border_color(gpui::black()),
-                    ),
-            )
-    }
-}
-
-struct Items;
 
 impl Items {
+    fn new(buf: Entity<Buf>, selecting: Entity<Selecting>, cx: &mut App) -> Entity<Self> {
+        cx.new(|_| Self { buf, selecting })
+    }
+}
+
+impl Render for Items {
     #[tracing::instrument(skip_all)]
-    fn compute_element(
-        &self,
-        buf: &Entity<Buffer<(LelkeEntry, usize)>>,
-        cx: &mut App,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // ここではbufferの中身を見なならloopをまわしてLelkeEntry -> ElementにしてcacheしつつListにする
-        let buf = buf.read(cx);
+        let buf = self.buf.read(cx);
         let mut pos = Position::default();
 
         debug!("buffer length: {}", buf.len());
@@ -439,5 +525,14 @@ impl Items {
         }
 
         div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .size(px(200.0))
+            .justify_center()
+            .items_center()
+            .shadow_lg()
+            .text_xl()
+            .child(format!("Pos: {}", self.selecting.read(cx).0))
     }
 }

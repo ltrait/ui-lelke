@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
                 app_id: Some("lelke".into()),
                 theme: LelkeTheme::default_dark(),
                 bindings: Arc::new(ltrait_ui_lelke::example_bindings),
+                placeholder: "Go lelke...",
             }),
             |Context::Simple(u)| LelkeEntry {
                 ty: ltrait_ui_lelke::LelkeEntryType::Simple(*u),
