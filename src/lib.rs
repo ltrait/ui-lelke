@@ -20,7 +20,7 @@ use futures::{
     future::{Either, select},
 };
 use futures_timer::Delay;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, info_span};
 
 use ltrait::{
     UI,
@@ -387,6 +387,15 @@ where
                     theme.apply(win);
 
                     binder.bind_keys(cx);
+
+                    win.on_window_should_close(cx, |_, cx| {
+                        let _span = info_span!("Re-quit");
+                        let _enter = _span.enter();
+
+                        actions::quit(&actions::Quit, cx);
+
+                        true
+                    });
 
                     let view = cx.new(|cx| {
                         let mut _subscriptions = vec![];
