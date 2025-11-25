@@ -9,3 +9,5 @@ result-*
 
 /target
 Cargo.lock
+
+.serena

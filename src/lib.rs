@@ -1,6 +1,7 @@
 use gpui::{
-    Action, App, Application, AsyncApp, Bounds, Context, Entity, Global, KeyBinding, Rgba,
-    Subscription, Window, WindowBounds, WindowOptions, colors::Colors, div, prelude::*, px, size,
+    Action, App, Application, AsyncApp, Bounds, Context, Entity, Global, KeyBinding, Keystroke,
+    Rgba, Subscription, Window, WindowBounds, WindowOptions, colors::Colors, div,
+    prelude::*, px, size,
 };
 
 pub use gpui::{
@@ -9,7 +10,8 @@ pub use gpui::{
 };
 use gpui_component::{
     Root,
-    input::{InputEvent, InputState, TextInput},
+    input::{Input, InputEvent, InputState},
+    kbd::Kbd,
 };
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -52,6 +54,7 @@ pub struct LelkeTheme {
     pub selected_bg: Rgba,
     pub selected_fg: Rgba,
     pub border: Rgba,
+    pub accent: Rgba,
     pub font: Option<Font>,
 }
 
@@ -62,8 +65,9 @@ impl From<Colors> for LelkeTheme {
             border: value.border,
             entry_bg: value.container,
             entry_fg: value.text,
-            selected_bg: value.disabled,
-            selected_fg: value.selected,
+            selected_bg: value.selected,
+            selected_fg: value.selected_text,
+            accent: value.selected,
             background_appearance: gpui::WindowBackgroundAppearance::Opaque,
             font: None,
         }
@@ -76,7 +80,17 @@ impl LelkeTheme {
     }
 
     pub fn default_dark() -> Self {
-        Colors::dark().into()
+        Self {
+            bg: gpui::rgb(0x1a1b26),
+            entry_bg: gpui::rgb(0x24283b),
+            entry_fg: gpui::rgb(0xc0caf5),
+            selected_bg: gpui::rgb(0x33467c),
+            selected_fg: gpui::rgb(0xf0f0f0),
+            border: gpui::rgb(0x2f334d),
+            accent: gpui::rgb(0x7aa2f7),
+            background_appearance: gpui::WindowBackgroundAppearance::Opaque,
+            font: None,
+        }
     }
 
     pub fn default_light() -> Self {
@@ -231,8 +245,8 @@ pub fn example_bindings(kbd: &mut KeyBinder) {
 
     kbd.bind("tab", MoveNext);
     kbd.bind("shift-tab", MovePrevious);
-    kbd.bind("up", MoveNext); // TODO: いまのところは下入力想定
-    kbd.bind("down", MovePrevious);
+    kbd.bind("up", MovePrevious);
+    kbd.bind("down", MoveNext);
     kbd.bind("escape", Quit);
     kbd.bind("enter", Select);
 }
@@ -292,6 +306,7 @@ async fn batcher_thread<Cushion>(
     mut inrx: mpsc::Receiver<()>,
     user_input: Entity<SharedString>,
     selecting: Entity<Selecting>,
+    collecting: Entity<bool>,
 ) -> Result<()>
 where
     Cushion: Send + Sync + 'static,
@@ -327,6 +342,10 @@ where
                     v
                 })
                 .map_err(|err| eyre!("{err}"))??;
+
+            collecting
+                .update(&mut cx, |_, _| more)
+                .map_err(|err| eyre!("{err}"))?;
         } else {
             match select(inrx.next(), &mut rx).await {
                 Either::Left((Some(()), _)) => set_input(
@@ -413,6 +432,9 @@ where
                         let selecting = cx.new(|_| Selecting(0));
                         _subscriptions.push(cx.observe(&selecting, |_, _, _| ()));
 
+                        let state_indicator = cx.new(StateIndicator::new);
+                        let collecting = state_indicator.read_with(cx, |v, _| v.collecting.clone());
+
                         {
                             let buf = buf.clone();
                             let user_input = user_input.clone();
@@ -428,6 +450,7 @@ where
                                     inrx,
                                     user_input,
                                     selecting,
+                                    collecting,
                                 )
                                 .await
                                 {
@@ -461,13 +484,14 @@ where
                         }));
 
                         RootView {
+                            state_indicator,
                             input_state,
                             items,
                             _subscriptions,
                         }
                     });
 
-                    cx.new(|cx| Root::new(view.into(), win, cx))
+                    cx.new(|cx| Root::new(view, win, cx))
                 },
             )
             .unwrap();
@@ -489,6 +513,7 @@ where
 // begin gpui
 
 struct RootView {
+    state_indicator: Entity<StateIndicator>,
     items: Entity<Items>,
     input_state: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -496,17 +521,62 @@ struct RootView {
 
 impl Render for RootView {
     #[tracing::instrument(skip_all)]
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = cx.global::<LelkeConfig>();
         let theme = &config.theme;
 
+        let select_kbd = Kbd::binding_for_action(&actions::Select, None, window)
+            .unwrap_or(Kbd::new(Keystroke::parse("enter").unwrap()));
+        let quit_kbd = Kbd::binding_for_action(&actions::Quit, None, window)
+            .unwrap_or(Kbd::new(Keystroke::parse("escape").unwrap()));
+        let next_kbd = Kbd::new(Keystroke::parse("tab").unwrap());
+        let prev_kbd = Kbd::new(Keystroke::parse("shift-tab").unwrap());
+
         div()
+            .flex()
+            .flex_col()
+            .size_full()
             .bg(theme.bg)
-            .border_1()
-            .border_color(theme.border)
-            .text_color(theme.entry_fg) // TODO: 違うかも
-            .child(self.items.clone())
-            .child(TextInput::new(&self.input_state)) // TODO:ここにfocusがあってほしい
+            .text_color(theme.entry_fg)
+            // input at top
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(Input::new(&self.input_state)),
+            )
+            // items list fills remaining space
+            .child(div().flex_1().child(self.items.clone()))
+            // compact footer
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(self.state_indicator.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(next_kbd)
+                            .child(prev_kbd)
+                            .child(select_kbd)
+                            .child(quit_kbd),
+                    ),
+            )
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 struct Items {
@@ -523,25 +593,169 @@ impl Items {
 impl Render for Items {
     #[tracing::instrument(skip_all)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // ここではbufferの中身を見なならloopをまわしてLelkeEntry -> ElementにしてcacheしつつListにする
+        let config = cx.global::<LelkeConfig>();
+        let theme = &config.theme;
+
         let buf = self.buf.read(cx);
+        let selecting = self.selecting.read(cx).0;
+
         let mut pos = Position::default();
+        let mut idx = 0usize;
 
         debug!("buffer length: {}", buf.len());
+
+        let mut list = div().flex().flex_col().w_full();
+
         while let Some((entry, _)) = buf.next(&mut pos) {
-            debug!("entry, pos: {entry:?} {pos:?}");
-            // TODO:
+            let is_selected = idx == selecting;
+
+            let bg = if is_selected {
+                theme.selected_bg
+            } else {
+                entry.style.bg.unwrap_or(theme.bg)
+            };
+            let fg = if is_selected {
+                theme.selected_fg
+            } else {
+                entry.style.fg.unwrap_or(theme.entry_fg)
+            };
+
+            let label: SharedString = match &entry.ty {
+                LelkeEntryType::Text { text, .. }
+                | LelkeEntryType::TextWithIcon { text, .. } => text.clone().into(),
+                #[cfg(feature = "dev")]
+                LelkeEntryType::Simple(u) => format!("Simple({u})").into(),
+            };
+
+            let right: Option<SharedString> = match &entry.ty {
+                LelkeEntryType::Text { right_text, .. }
+                | LelkeEntryType::TextWithIcon { right_text, .. } => {
+                    right_text.clone().map(Into::into)
+                }
+                #[cfg(feature = "dev")]
+                LelkeEntryType::Simple(_) => None,
+            };
+
+            let icon_path: Option<PathBuf> = match &entry.ty {
+                LelkeEntryType::TextWithIcon { icon, .. } => Some(icon.clone()),
+                _ => None,
+            };
+
+            // accent left border for selected row
+            let accent_bar = if is_selected {
+                div().w(px(3.)).h(px(28.)).bg(theme.accent)
+            } else {
+                div().w(px(3.)).h(px(28.))
+            };
+
+            // left side: optional icon + label
+            let mut left = div().flex().items_center().gap_2();
+
+            if let Some(icon) = icon_path {
+                left = left.child(
+                    gpui::img(icon)
+                        .w(px(20.))
+                        .h(px(20.))
+                        .flex_none(),
+                );
+            }
+
+            left = left.child(label);
+
+            // right side: right_text in muted color
+            let mut content = div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .text_color(fg);
+
+            content = content.child(left);
+
+            if let Some(right) = right {
+                content = content.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.border)
+                        .child(right),
+                );
+            }
+
+            let row = div()
+                .flex()
+                .items_center()
+                .w_full()
+                .bg(bg)
+                .child(accent_bar)
+                .child(div().flex_1().child(content));
+
+            list = list.child(row);
+
+            idx += 1;
         }
 
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .size(px(200.0))
-            .justify_center()
+            .w_full()
+            .h_full()
+            .id("items-scroll")
+            .overflow_y_scroll()
+            .child(list)
+    }
+}
+
+struct StateIndicator {
+    collecting: Entity<bool>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl StateIndicator {
+    fn new(cx: &mut Context<'_, Self>) -> Self {
+        let mut _subscriptions = vec![];
+
+        let collecting = cx.new(|_| true);
+        _subscriptions.push(cx.observe(&collecting, |_, _, _| ()));
+
+        Self {
+            collecting: collecting.clone(),
+            _subscriptions,
+        }
+    }
+}
+
+impl Render for StateIndicator {
+    #[tracing::instrument(skip_all)]
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let collecting = *self.collecting.read(cx);
+        let config = cx.global::<LelkeConfig>();
+        let theme = &config.theme;
+
+        // accent when collecting, muted when done
+        let dot_color = if collecting {
+            theme.accent
+        } else {
+            gpui::rgb(0x6b6b6b)
+        };
+
+        div()
+            .flex()
             .items_center()
-            .shadow_lg()
-            .text_xl()
-            .child(format!("Pos: {}", self.selecting.read(cx).0))
+            .gap_1p5()
+            .text_xs()
+            .text_color(theme.border)
+            .child(
+                div()
+                    .w(px(8.))
+                    .h(px(8.))
+                    .rounded_full()
+                    .bg(dot_color),
+            )
+            .child(if collecting {
+                "Loading"
+            } else {
+                "Ready"
+            })
     }
 }
